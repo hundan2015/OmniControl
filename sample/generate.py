@@ -12,7 +12,7 @@ from utils.model_util import create_model_and_diffusion, load_model_wo_clip
 from utils import dist_util
 from model.cfg_sampler import ClassifierFreeSampleModel
 from data_loaders.get_data import get_dataset_loader
-from data_loaders.humanml.scripts.motion_process import recover_from_ric
+from data_loaders.humanml.scripts.motion_process import recover_from_ric,recover_from_rot
 import data_loaders.humanml.utils.paramUtil as paramUtil
 from data_loaders.humanml.utils.plot_script import plot_3d_motion
 import shutil
@@ -112,27 +112,119 @@ def main():
             model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
 
         sample_fn = diffusion.p_sample_loop
+        ##############
+        # Custom input
+        ##############
 
+        def make_raw_data(data_):
+            dataset = data.dataset.t2m_dataset
+            return (data_-dataset.mean)/dataset.std
+        def make_ano_data(data_):
+            dataset = data.dataset.t2m_dataset
+            return (data_)*dataset.std+dataset.mean
+
+        skip_timesteps = 980
+        
+        # 添加自定义数据
+        ori_loaded_data_np = np.load(fr"dataset\HumanML3D\new_joint_vecs\000000.npy")
+        ori_loaded_data = torch.from_numpy(ori_loaded_data_np).clone().to("cuda:0")
+        
+        loaded_data = make_raw_data(ori_loaded_data_np)
+        # loaded_data = make_ano_data(loaded_data)
+        loaded_data = torch.from_numpy(loaded_data).to("cuda:0")
+        
+        # 生成自定义hints
+        loaded_pos_data = recover_from_ric(ori_loaded_data, 22)
+        loaded_pos_data[:, :20, :] = 0
+        loaded_pos_data[:, 21, :] = 0
+        # loaded_pos_data = loaded_pos_data.view(-1, 3*22)
+        loaded_pos_data = torch.flatten(loaded_pos_data,start_dim=1,end_dim=-1)
+        
+        if loaded_pos_data.shape[0] < 196:
+            zeros = torch.zeros(
+                (196-loaded_pos_data.shape[0], loaded_pos_data.shape[1])).to("cuda:0")
+            loaded_pos_data = torch.cat((loaded_pos_data, zeros))
+        loaded_pos_data = loaded_pos_data.unsqueeze(0)
+        
+        model_kwargs['y']['hint'] = loaded_pos_data
+            
+        if loaded_data.shape[0] < 196:
+            zeros = torch.zeros(
+                (196-loaded_data.shape[0], loaded_data.shape[1])).to("cuda:0")
+            loaded_data = torch.cat((loaded_data, zeros))
+        loaded_data = loaded_data.unsqueeze(0)
+        loaded_data = loaded_data.unsqueeze(0)
+        loaded_data = loaded_data.permute(0, 3, 1, 2)
+        
+        '''
+        Noise: 直接作为中间结果输入，不添加任何噪声
+        init_image: 作为初始情况输入，根据skip_timesteps剩下的添加噪声
+        hint: Tensor(batch_count,frame_count,joint_count * 3)
+        '''
         sample = sample_fn(
             model,
             (args.batch_size, model.njoints, model.nfeats, n_frames),
             clip_denoised=False,
             model_kwargs=model_kwargs,
-            skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
-            init_image=None,
+            skip_timesteps=skip_timesteps,  # 0 is the default value - i.e. don't skip any step
+            init_image=loaded_data,
             progress=True,
             dump_steps=None,
             noise=None,
             const_noise=False,
         )
+        ##############
+        # Original
+        
+        # sample = sample_fn(
+        #     model,
+        #     (args.batch_size, model.njoints, model.nfeats, n_frames),
+        #     clip_denoised=False,
+        #     model_kwargs=model_kwargs,
+        #     skip_timesteps=skip_timesteps,  # 0 is the default value - i.e. don't skip any step
+        #     init_image=None,
+        #     progress=True,
+        #     dump_steps=None,
+        #     noise=None,
+        #     const_noise=False,
+        # )
 
         sample = sample[:, :263]
         # Recover XYZ *positions* from HumanML3D vector representation
+        
         if model.data_rep == 'hml_vec':
             n_joints = 22 if sample.shape[1] == 263 else 21
             sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
-            sample = recover_from_ric(sample, n_joints)
+            ##########
+            np.save("sample_original.npy",sample.numpy())
+            
+            from common.skeleton import Skeleton
+            
+            n_raw_offsets = torch.from_numpy(paramUtil.t2m_raw_offsets)
+            kinematic_chain = paramUtil.t2m_kinematic_chain
+            tgt_skel = Skeleton(n_raw_offsets, kinematic_chain, sample.device)
+            from paramUtil import tgt_offsets
+            tgt_offsets_now = torch.from_numpy(tgt_offsets).clone()
+            # 脊柱缩放
+            tgt_offsets_now[3] *= 1.5
+            tgt_offsets_now[6] *= 1.5
+            tgt_offsets_now[9] *= 1.5
+
+            # 手臂
+            for i in range(14,22):
+                tgt_offsets_now[i] *= 1.7
+
+            tgt_skel.set_offset(tgt_offsets_now)
+            # print(tgt_skel.offset()[3])
+            joint_pos = recover_from_rot(
+                sample.view(-1, 263), n_joints, tgt_skel)
+            joint_pos = joint_pos.view(args.batch_size, n_frames, n_joints, -1)
+            joint_pos.unsqueeze_(0)
+            sample = joint_pos
+            # sample = recover_from_ric(sample, n_joints)
+            ##########
             sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
+            
 
         rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
         rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()

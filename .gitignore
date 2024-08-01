@@ -139,3 +139,7 @@ hint.npy
 t2m
 submit.sh
 scripts_/
+
+omnicontrol_ckpt.zip
+dataset/HumanML3D
+omnicontrol_ckpt

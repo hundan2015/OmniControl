@@ -15,7 +15,9 @@ import torch as th
 from copy import deepcopy
 from diffusion.nn import mean_flat, sum_flat
 from data_loaders.humanml.scripts.motion_process import recover_from_ric
+from data_loaders.humanml.scripts.motion_process import recover_from_rot
 from os.path import join as pjoin
+from paramUtil import *
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
@@ -428,11 +430,40 @@ class GaussianDiffusion:
             x_ = x_.squeeze(2)
             x_ = x_ * self.std + self.mean
             n_joints = 22 if x_.shape[-1] == 263 else 21
-            joint_pos = recover_from_ric(x_, n_joints)
+
+            ########################################
+            #            Key Point                 #   
+            ########################################
+            from common.skeleton import Skeleton
+            
+            n_raw_offsets = torch.from_numpy(t2m_raw_offsets)
+            kinematic_chain = t2m_kinematic_chain
+            tgt_skel = Skeleton(n_raw_offsets, kinematic_chain, x_.device)
+
+            tgt_offsets_now = torch.from_numpy(tgt_offsets).clone()
+            # 脊柱缩放
+            tgt_offsets_now[3] *= 1.5
+            tgt_offsets_now[6] *= 1.5
+            tgt_offsets_now[9] *= 1.5
+
+            # 手臂
+            for i in range(14,22):
+                tgt_offsets_now[i] *= 1.7
+
+            tgt_skel.set_offset(tgt_offsets_now)
+            # print(tgt_skel.offset()[3])
+            joint_pos = recover_from_rot(x_.view(-1,263),n_joints,tgt_skel)
+            joint_pos = joint_pos.view(hint.shape[0],hint.shape[1],n_joints,-1)
+
+            # joint_pos = recover_from_ric(x_, n_joints)
+            ########################################
+            #            Key Point Ends            #   
+            ########################################
+            
             if n_joints == 21:
                 joint_pos = joint_pos * 0.001
                 hint = hint * 0.001
-
+            
             loss = torch.norm((joint_pos - hint) * mask_hint, dim=-1)
             grad = torch.autograd.grad([loss.sum()], [x])[0]
             # the motion in HumanML3D always starts at the origin (0,y,0), so we zero out the gradients for the root joint
@@ -467,7 +498,10 @@ class GaussianDiffusion:
             if t[0] < 10:
                 n_guide_steps = 500
             else:
-                n_guide_steps = 10
+                # n_guide_steps = 10
+                ###############
+                ## EDITED##
+                n_guide_steps = 500
 
         # process hint
         hint = model_kwargs['y']['hint'].clone().detach()

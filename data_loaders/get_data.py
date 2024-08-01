@@ -35,10 +35,10 @@ def get_dataset(name, num_frames, split='train', hml_mode='train', control_joint
 def get_dataset_loader(name, batch_size, num_frames, split='train', hml_mode='train', control_joint=0, density=100):
     dataset = get_dataset(name, num_frames, split, hml_mode, control_joint, density)
     collate = get_collate_fn(name, hml_mode)
-
+    # workers == 8
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=8, drop_last=True, collate_fn=collate,
+        num_workers=1, drop_last=True, collate_fn=collate,
     )
 
     return loader
